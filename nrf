@@ -1,0 +1,138 @@
+#include <SPI.h>
+#include <RF24.h>
+#include "esp_bt.h"
+#include "esp_wifi.h"
+#include "esp_system.h"
+
+// ================= BUTTON CONFIGURATION =================
+const int buttonPin = 4;       // D4 = GPIO 4
+bool isTransmitting = false;   // Default state: OFF
+// ========================================================
+
+// SPI Instances
+SPIClass *sp = nullptr; // VSPI for radio1
+SPIClass *hp = nullptr; // HSPI for radio
+
+// RF24 Objects: CE, CSN, Speed
+// HSPI: CE=27, CSN=15
+RF24 radio(27, 15, 16000000); 
+
+// VSPI: CE=22, CSN=21
+RF24 radio1(22, 21, 16000000); 
+
+int ch = 45;  // Initial channel for HSPI
+int ch1 = 45; // Initial channel for VSPI
+
+void disableWiFiAndClassicBT() {
+  esp_wifi_stop();
+  esp_wifi_deinit();
+  btStop(); 
+}
+
+void startTransmission() {
+  Serial.println("\n>>> SYSTEM ON: AGGRESSIVE RANDOM MODE STARTED");
+  
+  // VSPI Radio Setup
+  radio1.powerUp();
+  radio1.setAutoAck(false);
+  radio1.stopListening(); 
+  radio1.setRetries(0, 0);
+  radio1.setPALevel(RF24_PA_MAX, true); 
+  radio1.setDataRate(RF24_2MBPS);       
+  radio1.setCRCLength(RF24_CRC_DISABLED); 
+  radio1.startConstCarrier(RF24_PA_MAX, ch1);
+
+  // HSPI Radio Setup
+  radio.powerUp();
+  radio.setAutoAck(false);
+  radio.stopListening(); 
+  radio.setRetries(0, 0);
+  radio.setPALevel(RF24_PA_MAX, true); 
+  radio.setDataRate(RF24_2MBPS);       
+  radio.setCRCLength(RF24_CRC_DISABLED); 
+  radio.startConstCarrier(RF24_PA_MAX, ch);
+}
+
+void stopTransmission() {
+  Serial.println("\n>>> SYSTEM OFF: Transmission STOPPED (Radios Powered Down)");
+  radio.powerDown();
+  radio1.powerDown();
+}
+
+// ULTRA-FAST Button Check (No blocking delays, original speed maintain karega)
+void checkButton() {
+  static int lastState = HIGH;
+  static unsigned long lastTime = 0;
+  int currentState = digitalRead(buttonPin);
+  
+  // Agar button daba hai (LOW) aur pichli baar se 300ms ho chuke hain
+  if (currentState == LOW && lastState == HIGH && (millis() - lastTime) > 300) {
+    lastTime = millis();
+    isTransmitting = !isTransmitting;
+    
+    if (isTransmitting) {
+      startTransmission();
+    } else {
+      stopTransmission();
+    }
+  }
+  lastState = currentState;
+}
+
+// EXACT ORIGINAL AGGRESSIVE LOGIC (NO DELAY HERE)
+void aggressiveRandomMode() {
+  uint8_t randCh1 = random(80);
+  uint8_t randCh = random(80);
+  
+  radio1.setChannel(randCh1);
+  radio.setChannel(randCh);
+}
+
+void initSP() {
+  sp = new SPIClass(VSPI);
+  sp->begin(18, 19, 23, 21); 
+  if (radio1.begin(sp)) {
+    Serial.println("VSPI (Radio1) Started !!!");
+  } else {
+    Serial.println("VSPI (Radio1) couldn't start !!!");
+  }
+}
+
+void initHP() {
+  hp = new SPIClass(HSPI);
+  hp->begin(14, 12, 13, 15); 
+  if (radio.begin(hp)) {
+    Serial.println("HSPI (Radio) Started !!!");
+  } else {
+    Serial.println("HSPI (Radio) couldn't start !!!");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  setCpuFrequencyMhz(240);
+  disableWiFiAndClassicBT();
+  
+  pinMode(buttonPin, INPUT_PULLUP);
+  
+  initHP(); 
+  initSP(); 
+
+  // Start me system OFF rahega (Safety)
+  stopTransmission();
+
+  Serial.println("\n========================================");
+  Serial.println(" READY: Button connected to D4 (GPIO 4)");
+  Serial.println(" Press button to START/STOP transmission");
+  Serial.println("========================================");
+}
+
+void loop() {
+  checkButton(); // Button check karo (takes ~1 microsecond, almost zero delay)
+  
+  if (isTransmitting) {
+    aggressiveRandomMode(); // Bina kisi delay ke super fast chalega (Original jaisa)
+  }
+}
